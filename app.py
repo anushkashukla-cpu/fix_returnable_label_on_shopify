@@ -1,17 +1,19 @@
 """
-Return Label Manager, for category managers.
+Return Labels, for category managers.
 
-The sheet has three columns:
-    SKU | Return (Yes/No) | Return_days
+Sign in with your work email. Search for products or upload a sheet
+(SKU, Return, Return_days), set Return and Return days in the table, click Apply.
+Every change is saved on the product in Shopify with who made it and when.
 
-Run on a Mac:
-    export SHOPIFY_STORE=... SHOPIFY_CLIENT_ID=... SHOPIFY_CLIENT_SECRET=...
-    python3 -m streamlit run app.py
-Online (Streamlit Cloud): put the same values, plus APP_PASSWORD, in Secrets.
+Settings (Streamlit Secrets, or .streamlit/secrets.toml on a Mac):
+    SHOPIFY_STORE, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET
+    [users]
+    "name@home-run.co" = "password"
 """
 import copy
 import datetime
 import hmac
+import html
 import io
 import json
 import os
@@ -24,8 +26,15 @@ import streamlit as st
 
 # ---------------- Settings ----------------
 API_VERSION = "2026-04"
-NAMESPACE, KEY = "custom", "product_labels"
-BATCH_SIZE = 25  # Shopify allows up to 25 metafields per write
+NS = "custom"
+LABELS_KEY = "product_labels"
+HISTORY_KEY = "return_label_history"  # who changed what, kept on each product
+HISTORY_KEEP = 20                     # changes kept per product
+BATCH_PRODUCTS = 12                   # 2 metafields per product; Shopify takes 25 per call
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+EDITOR_HEIGHT = 390
+PAGE_SIZE = 10
+GRID_WIDTHS = [1.1, 4, 1.5, 1.3, 1.4, 1.1]
 
 RETURN_ICON = "https://cdn.shopify.com/s/files/1/0872/6095/4939/files/Return.png?v=1761551571"
 
@@ -40,7 +49,6 @@ NON_RETURNABLE = {
 
 
 def returnable_block(days):
-    """Returnable label with the return window filled in from the sheet."""
     unit = "Day" if days == 1 else "Days"
     return {
         "type": "return",
@@ -85,11 +93,13 @@ DEFAULT_LABELS = {
 _ver = tuple(int(x) for x in st.__version__.split(".")[:2])
 STRETCH = {"width": "stretch"} if _ver >= (1, 52) else {"use_container_width": True}
 
-SAMPLE_SHEET = "SKU,Return,Return_days\nHZKY8,No,\nSKYJQ,Yes,7\nQMJFF,Yes,3\n"
+
+def md(text):
+    """Show text as-is (no accidental bold/links from product names)."""
+    return re.sub(r"([\\`*_{}\[\]<>()#+\-.!|~])", r"\\\1", str(text))
 
 
 def cfg(name):
-    """Read a setting from Terminal (export) or from the host's Secrets."""
     if os.environ.get(name):
         return os.environ[name]
     try:
@@ -98,10 +108,16 @@ def cfg(name):
         return ""
 
 
+def load_users():
+    try:
+        return {str(k).strip().lower(): str(v) for k, v in dict(st.secrets.get("users", {})).items()}
+    except Exception:
+        return {}
+
+
 SHOP = cfg("SHOPIFY_STORE")
 CLIENT_ID = cfg("SHOPIFY_CLIENT_ID")
 CLIENT_SECRET = cfg("SHOPIFY_CLIENT_SECRET")
-APP_PASSWORD = cfg("APP_PASSWORD")
 GQL_URL = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
 
 
@@ -147,12 +163,16 @@ def gql(query, variables):
 
 
 VARIANTS_QUERY = """
-query($cursor: String, $ns: String!, $key: String!) {
+query($cursor: String) {
   productVariants(first: 250, after: $cursor) {
     pageInfo { hasNextPage endCursor }
     nodes {
       sku
-      product { id title status metafield(namespace: $ns, key: $key) { type value } }
+      product {
+        id title status
+        labels: metafield(namespace: "custom", key: "product_labels") { type value }
+        history: metafield(namespace: "custom", key: "return_label_history") { value }
+      }
     }
   }
 }
@@ -168,15 +188,23 @@ mutation($m: [MetafieldsSetInput!]!) {
 """
 
 
+def parse_history(mf):
+    try:
+        data = json.loads((mf or {}).get("value") or "[]")
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
 def load_store():
     products, cursor = {}, None
     while True:
-        page = gql(VARIANTS_QUERY, {"cursor": cursor, "ns": NAMESPACE, "key": KEY})["productVariants"]
+        page = gql(VARIANTS_QUERY, {"cursor": cursor})["productVariants"]
         for v in page["nodes"]:
             p = v["product"]
             rec = products.setdefault(p["id"], {
-                "id": p["id"], "title": p["title"], "status": p["status"],
-                "skus": set(), "mf": p["metafield"],
+                "id": p["id"], "title": p["title"], "status": p["status"], "skus": set(),
+                "mf": p["labels"], "history": parse_history(p["history"]),
             })
             sku = (v["sku"] or "").strip()
             if sku:
@@ -184,6 +212,11 @@ def load_store():
         if not page["pageInfo"]["hasNextPage"]:
             return products
         cursor = page["pageInfo"]["endCursor"]
+
+
+def reload_products():
+    with st.spinner("Getting the latest labels from Shopify…"):
+        st.session_state["products"] = load_store()
 
 
 # ---------------- Label logic ----------------
@@ -202,7 +235,7 @@ def find_return(labels):
 
 
 def read_current(mf):
-    """Returns (state, return_entry). state is 'empty', 'invalid' or 'ok'."""
+    """(state, return_entry); state is 'empty', 'invalid' or 'ok'."""
     if not mf or not (mf.get("value") or "").strip():
         return "empty", None
     try:
@@ -211,26 +244,28 @@ def read_current(mf):
         return "invalid", None
 
 
-def describe(entry):
-    if entry is None:
-        return "No return label"
+def current_rule(state, entry):
+    """Current label as (Return, Return days) for the table: ('Yes', 3), ('No', None) or (None, None)."""
+    if state != "ok" or entry is None:
+        return None, None
     text = f"{entry.get('title', '')} {entry.get('heading', '')}".lower()
     if "non" in text:
-        return "Non Returnable"
+        return "No", None
     m = re.search(r"\d+", str(entry.get("title", "")))
-    if not m:
-        return "Returnable"
-    n = int(m.group())
-    return f"Returnable, {n} day" if n == 1 else f"Returnable, {n} days"
+    return "Yes", (int(m.group()) if m else None)
 
 
-def describe_product(p):
-    state, entry = read_current(p["mf"])
+def describe(state, entry):
     if state == "empty":
         return "No labels yet"
-    if state == "invalid":
-        return "Broken labels, fix in Shopify"
-    return describe(entry)
+    ret, days = current_rule(state, entry)
+    if ret is None:
+        return "No return label"
+    if ret == "No":
+        return "Non Returnable"
+    if days is None:
+        return "Returnable"
+    return f"Returnable, {days} day" if days == 1 else f"Returnable, {days} days"
 
 
 def new_value(mf, block):
@@ -249,10 +284,6 @@ def new_value(mf, block):
 
 
 # ---------------- Sheet ----------------
-YES = {"yes", "y", "true", "1", "returnable"}
-NO = {"no", "n", "false", "0", "nonreturnable", "notreturnable"}
-
-
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
@@ -262,8 +293,18 @@ def pick(columns, *names):
     return next((by_norm[n] for n in names if n in by_norm), None)
 
 
+def to_days(value):
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        return "bad"
+
+
 def read_sheet(uploaded):
-    """Returns ({sku: (returnable, days)}, [problems])."""
+    """Returns ([(sku, Return, days)], notes)."""
     raw = uploaded.getvalue()
     if uploaded.name.lower().endswith((".xlsx", ".xls")):
         df = pd.read_excel(io.BytesIO(raw), dtype=str).fillna("")
@@ -277,317 +318,394 @@ def read_sheet(uploaded):
     c_days = pick(df.columns, "returndays", "returnwindow", "returnwindowdays", "days")
     missing = [n for n, c in (("SKU", c_sku), ("Return", c_ret), ("Return_days", c_days)) if c is None]
     if missing:
-        raise ValueError(
-            f"The sheet is missing: {', '.join(missing)}. "
-            "It needs three columns: SKU, Return (Yes/No) and Return_days. Download the sample sheet to see the format."
-        )
+        raise ValueError(f"The sheet is missing: {', '.join(missing)}. It needs the columns SKU, Return and Return_days.")
 
-    rules, problems, conflicted = {}, [], set()
+    items, notes = {}, []
     for i, r in df.iterrows():
         sku = str(r[c_sku]).strip()
         if not sku or sku.lower() == "nan":
             continue
-        row = i + 2  # header is row 1
-        ret = norm(r[c_ret])
-        if ret in YES:
-            try:
-                days = int(float(str(r[c_days]).strip()))
-            except ValueError:
-                days = 0
-            if days <= 0:
-                problems.append({"SKU": sku, "Issue": f"Row {row}: Return is Yes but Return_days is empty or not a number"})
-                continue
-            rule = (True, days)
-        elif ret in NO:
-            rule = (False, 0)  # Return_days is ignored for No
-        else:
-            problems.append({"SKU": sku, "Issue": f"Row {row}: Return should be Yes or No, found '{r[c_ret]}'"})
-            continue
-        if sku in rules and rules[sku] != rule:
-            conflicted.add(sku)
-        rules[sku] = rule
-
-    for sku in conflicted:
-        rules.pop(sku, None)
-        problems.append({"SKU": sku, "Issue": "Listed more than once with different values, fix the sheet"})
-    return rules, problems
+        row = i + 2
+        ret_raw = norm(r[c_ret])
+        ret = "Yes" if ret_raw in ("yes", "y", "true") else "No" if ret_raw in ("no", "n", "false") else None
+        if ret is None:
+            notes.append(f"{sku}: row {row} has Return '{r[c_ret]}'. Pick Yes or No in the table.")
+        days = to_days(r[c_days])
+        if days == "bad":
+            notes.append(f"{sku}: row {row} has Return_days '{r[c_days]}', which isn't a number.")
+            days = None
+        if sku in items and items[sku] != (ret, days):
+            notes.append(f"{sku}: listed more than once with different values, using row {row}.")
+        items[sku] = (ret, days)
+    return [(s, r, d) for s, (r, d) in items.items()], notes
 
 
-# ---------------- Plan ----------------
-def status_and_window(state, entry):
-    """What a label shows, split into (status, return window)."""
-    if state == "empty":
-        return "No labels yet", ""
-    if entry is None:
-        return "No return label", ""
-    text = f"{entry.get('title', '')} {entry.get('heading', '')}".lower()
-    if "non" in text:
-        return "Non Returnable", "—"
-    m = re.search(r"\d+", str(entry.get("title", "")))
-    if not m:
-        return "Returnable", ""
-    n = int(m.group())
-    return "Returnable", f"{n} day" if n == 1 else f"{n} days"
-
-
-def build_plan(products, rules):
-    """Returns (table rows per SKU, writes per product, draft/archived SKU count, problems)."""
+# ---------------- Table ----------------
+def build_table(products, items):
+    """items: [(sku, Return, days)] -> (DataFrame for the editor, notes)."""
     sku_to_pid = {s: p["id"] for p in products.values() for s in p["skus"]}
-    problems, per_product = [], {}
-    for sku, rule in rules.items():
+    rows, notes = [], []
+    for sku, ret, days in items:
         pid = sku_to_pid.get(sku)
         if pid is None:
-            problems.append({"SKU": sku, "Issue": "Not found in Shopify"})
-        else:
-            per_product.setdefault(pid, {})[sku] = rule
-
-    table, writes, inactive = [], [], 0
-    for pid, sku_rules in per_product.items():
+            notes.append(f"{sku}: not found in Shopify.")
+            continue
         p = products[pid]
         if p["status"] in ("DRAFT", "ARCHIVED"):
-            inactive += len(sku_rules)
+            notes.append(f"{sku}: {p['status'].title()} product, not changed.")
             continue
-
-        values = set(sku_rules.values())
-        if any(not ret for ret, _ in values):
-            returnable, days = False, 0  # one Non Returnable variant makes the product Non Returnable
-        else:
-            returnable, days = True, min(d for _, d in values)  # shortest window is the safe one
-
         state, entry = read_current(p["mf"])
         if state == "invalid":
-            problems.append({"SKU": ", ".join(sorted(sku_rules)), "Issue": f"{p['title']}: labels in Shopify are broken, fix them by hand"})
+            notes.append(f"{sku}: its labels in Shopify are broken. Fix them in Shopify admin.")
             continue
+        cur_ret, cur_days = current_rule(state, entry)
+        if ret == "No" and not days:
+            days = 0  # non-returnable always has a 0-day window
+        rows.append({
+            "SKU": sku,
+            "Product": p["title"],
+            "Current status": describe(state, entry).split(",")[0],
+            "Current return days": 0.0 if cur_ret == "No" else (float(cur_days) if cur_days is not None else None),
+            "Return": ret,
+            "Return days": float(days) if days is not None else None,
+            "pid": pid,
+        })
+    df = pd.DataFrame(rows, columns=["SKU", "Product", "Current status", "Current return days", "Return", "Return days", "pid"])
+    return df, notes
 
-        block = target_block(returnable, days)
-        cur_status, cur_window = status_and_window(state, entry)
-        new_status, new_window = status_and_window("ok", block)
-        unchanged = entry is not None and all(entry.get(k) == v for k, v in block.items())
-        if unchanged:
-            change = "No change"
-        elif cur_status != new_status:
-            change = "Status"
-        elif cur_window != new_window:
-            change = "Return window"
+
+def search_items(products, query, limit=200):
+    q = query.strip().lower()
+    items = []
+    for p in products.values():
+        if p["status"] in ("DRAFT", "ARCHIVED"):
+            continue
+        if q in p["title"].lower() or any(q in s.lower() for s in p["skus"]):
+            ret, days = current_rule(*read_current(p["mf"]))
+            if ret == "No":
+                days = 0
+            items += [(s, ret, days) for s in sorted(p["skus"])]
+            if len(items) >= limit:
+                break
+    return items
+
+
+def on_return_change(ret_key, days_key):
+    """Global rule: Non Returnable means a 0-day window."""
+    if st.session_state.get(ret_key) == "No":
+        st.session_state[days_key] = "0"
+    elif str(st.session_state.get(days_key, "")).strip() == "0":
+        st.session_state[days_key] = ""
+
+
+def clean(ret, days):
+    """Normalise a row: Return -> 'Yes'/'No'/None, days -> int, None, or 'bad'."""
+    ret = ret if ret in ("Yes", "No") else None
+    if days is None or (isinstance(days, float) and pd.isna(days)):
+        return ret, None
+    text = str(days).strip()
+    if not text:
+        return ret, None
+    try:
+        n = float(text)
+    except ValueError:
+        return ret, "bad"
+    if n != int(n) or not 0 <= n <= 365:
+        return ret, "bad"
+    return ret, int(n)
+
+
+def plan_changes(products, edited, base, only_edited):
+    """Check the table and work out what to write. only_edited: skip rows the user didn't touch (search)."""
+    errors, notes, per_product = [], [], {}
+    for i, row in edited.iterrows():
+        ret, days = clean(row["Return"], row["Return days"])
+        if only_edited and (ret, days) == clean(base.loc[i, "Return"], base.loc[i, "Return days"]):
+            continue
+        sku = row["SKU"]
+        if days == "bad":
+            errors.append(f"{sku}: Return days must be a whole number (0 to 365).")
+            continue
+        if ret is None:
+            if days:
+                errors.append(f"{sku}: choose Yes or No.")
+            continue
+        if ret == "No" and days:
+            errors.append(f"{sku}: it's non-returnable, so its return window must be 0, not {days}.")
+        elif ret == "Yes" and days is None:
+            errors.append(f"{sku}: it's returnable, so enter the return window in days.")
         else:
-            change = "Wording only"
+            per_product.setdefault(row["pid"], {})[sku] = (ret == "Yes", days or 0)
 
+    writes = []
+    for pid, rules in per_product.items():
+        values = set(rules.values())
+        if any(not r for r, _ in values):
+            returnable, days = False, 0
+        else:
+            returnable, days = True, min(d for _, d in values)
+        p = products[pid]
+        state, entry = read_current(p["mf"])
+        block = target_block(returnable, days)
+        if entry is not None and all(entry.get(k) == v for k, v in block.items()):
+            continue
         if len(values) > 1:
-            problems.append({"SKU": ", ".join(sorted(sku_rules)),
-                             "Issue": f"{p['title']}: variants have different values in the sheet, using {new_status} {new_window}".strip()})
-
-        for sku in sorted(sku_rules):
-            table.append({
-                "SKU": sku,
-                "Product": p["title"],
-                "Current status": cur_status,
-                "New status": new_status,
-                "Current return window": cur_window,
-                "New return window": new_window,
-                "Change": change,
-            })
-        if not unchanged:
-            writes.append({
-                "product_id": pid, "block": block,
-                "SKU": ", ".join(sorted(sku_rules)), "Product": p["title"],
-                "Now": f"{cur_status} {cur_window}".strip(), "After": f"{new_status} {new_window}".strip(),
-            })
-    table.sort(key=lambda r: r["Change"] == "No change")  # changes first
-    return table, writes, inactive, problems
+            notes.append(f"{p['title']}: variants have different values, so the whole product gets {describe('ok', block)}.")
+        writes.append({
+            "pid": pid, "block": block, "skus": ", ".join(sorted(rules)), "n": len(rules),
+            "before": describe(state, entry), "after": describe("ok", block),
+        })
+    return writes, errors, notes
 
 
-def apply_changes(products, rows):
-    backup = {r["product_id"]: products[r["product_id"]]["mf"] for r in rows}
-    results = []
-    for start in range(0, len(rows), BATCH_SIZE):
-        chunk = rows[start:start + BATCH_SIZE]
-        payload = [{
-            "ownerId": r["product_id"], "namespace": NAMESPACE, "key": KEY,
-            "type": (products[r["product_id"]]["mf"] or {}).get("type") or "json",
-            "value": json.dumps(new_value(products[r["product_id"]]["mf"], r["block"]), ensure_ascii=False),
-        } for r in chunk]
+def apply_changes(products, writes, user):
+    when = datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+    failed = []
+    for start in range(0, len(writes), BATCH_PRODUCTS):
+        chunk = writes[start:start + BATCH_PRODUCTS]
+        payload = []
+        for w in chunk:
+            p = products[w["pid"]]
+            entry = {"at": when, "by": user, "skus": w["skus"], "before": w["before"], "after": w["after"]}
+            payload += [
+                {"ownerId": w["pid"], "namespace": NS, "key": LABELS_KEY,
+                 "type": (p["mf"] or {}).get("type") or "json",
+                 "value": json.dumps(new_value(p["mf"], w["block"]), ensure_ascii=False)},
+                {"ownerId": w["pid"], "namespace": NS, "key": HISTORY_KEY, "type": "json",
+                 "value": json.dumps(([entry] + p["history"])[:HISTORY_KEEP], ensure_ascii=False)},
+            ]
         try:
             errs = gql(SET_MUTATION, {"m": payload})["metafieldsSet"]["userErrors"]
-            bad = {}
-            for e in errs:
-                idx = next((int(x) for x in (e.get("field") or []) if str(x).isdigit()), None)
-                bad[idx] = e["message"]
-            for i, r in enumerate(chunk):
-                msg = bad.get(i) or bad.get(None)
-                results.append({"SKU": r["SKU"], "Product": r["Product"], "Before": r["Now"], "After": r["After"],
-                                "Result": f"Failed: {msg}" if msg else "Done"})
+            if errs:  # Shopify saves all of a batch or none of it
+                failed += [(w["skus"], errs[0]["message"]) for w in chunk]
         except Exception as e:
-            for r in chunk:
-                results.append({"SKU": r["SKU"], "Product": r["Product"], "Before": r["Now"], "After": r["After"],
-                                "Result": f"Failed: {e}"})
-    return pd.DataFrame(results), json.dumps(backup, indent=2, ensure_ascii=False)
+            failed += [(w["skus"], str(e)) for w in chunk]
+    return failed
 
 
-def search(products, query, limit=100):
-    q = query.strip().lower()
-    out = []
-    for p in products.values():
-        if q in p["title"].lower() or any(q in s.lower() for s in p["skus"]):
-            state, entry = read_current(p["mf"])
-            status, window = ("Broken labels", "") if state == "invalid" else status_and_window(state, entry)
-            out.append({
-                "SKU": ", ".join(sorted(p["skus"])) or "(no SKU)",
-                "Product": p["title"],
-                "Return status": status,
-                "Return window": window,
-                "Shopify status": p["status"].title(),
-            })
-            if len(out) >= limit:
-                break
-    return pd.DataFrame(out)
-
-
-def table_height(n, cap=320):
-    return min(38 + 35 * max(n, 1), cap)
-
-
-HIGHLIGHT = "background-color: #FFF1C2; color: #1F1F1F; font-weight: 600"
-
-
-def highlight_changes(row):
-    styles = [""] * len(row)
-    cols = list(row.index)
-    if row["Current status"] != row["New status"]:
-        styles[cols.index("New status")] = HIGHLIGHT
-    if row["Current return window"] != row["New return window"]:
-        styles[cols.index("New return window")] = HIGHLIGHT
-    return styles
-
-
-def load_products(message):
-    with st.spinner(message):
-        st.session_state["products"] = load_store()
-        st.session_state["loaded_at"] = datetime.datetime.now().strftime("%d %b, %H:%M")
+def history_table(products):
+    rows = [{
+        "When (IST)": h.get("at", ""), "User": h.get("by", ""), "SKU": h.get("skus", ""),
+        "Product": p["title"], "Before": h.get("before", ""), "After": h.get("after", ""),
+    } for p in products.values() for h in p["history"]]
+    df = pd.DataFrame(rows, columns=["When (IST)", "User", "SKU", "Product", "Before", "After"])
+    return df.sort_values("When (IST)", ascending=False)
 
 
 # ---------------- Page ----------------
 st.set_page_config(page_title="Return labels", page_icon="🏷️", layout="wide")
+st.markdown("""
+<style>
+.block-container {padding-top: 2.5rem; padding-bottom: 0.5rem}
+/* table toolbar: show/hide columns, download, search, fullscreen */
+[data-testid="stElementToolbar"] {display: none !important}
+/* column menu: sort, format, autosize, pin, hide */
+[data-testid="stDataFrameColumnMenu"],
+div:has(> [data-testid="stDataFrameColumnMenu"]) {display: none !important}
+/* compact upload box, same height as the search box */
+[data-testid="stFileUploaderDropzone"] {padding: 0.3rem 0.75rem}
+[data-testid="stFileUploaderDropzoneInstructions"] small,
+[data-testid="stFileUploaderDropzoneInstructions"] svg {display: none}
+[data-testid="InputInstructions"] {display: none}
+/* compact rows in the edit grid; text cells as tall as the dropdowns so rows line up */
+.st-key-grid [data-testid="stVerticalBlock"] {gap: 0.35rem}
+.st-key-grid [data-testid="stMarkdownContainer"] {min-height: 2.5rem; display: flex; align-items: center}
+.st-key-grid [data-testid="stMarkdownContainer"] p {margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis}
+</style>
+""", unsafe_allow_html=True)
 
-if APP_PASSWORD and not st.session_state.get("signed_in"):
-    st.title("Return labels")
-    pw = st.text_input("Password", type="password")
-    if st.button("Sign in", type="primary"):
-        if hmac.compare_digest(pw, APP_PASSWORD):
-            st.session_state["signed_in"] = True
-            st.rerun()
-        else:
-            st.error("Wrong password.")
-    st.stop()
-
+USERS = load_users()
 if not (SHOP and CLIENT_ID and CLIENT_SECRET):
-    st.error("Shopify isn't connected. Add SHOPIFY_STORE, SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET to the app's settings.")
+    st.error("Shopify isn't connected. Add SHOPIFY_STORE, SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET to the app's Secrets.")
+    st.stop()
+if not USERS:
+    st.error("No users are set up yet. Add a [users] section with each person's email and password to the app's Secrets.")
     st.stop()
 
+# ---- Sign in ----
+if "user" not in st.session_state:
+    _, mid, _ = st.columns([1, 1, 1])
+    with mid:
+        st.subheader("Return labels")
+        with st.form("login"):
+            email = st.text_input("Work email")
+            password = st.text_input("Password", type="password")
+            signed = st.form_submit_button("Sign in", type="primary", **STRETCH)
+        if signed:
+            e = email.strip().lower()
+            if e in USERS and hmac.compare_digest(password, USERS[e]):
+                st.session_state["user"] = e
+                st.rerun()
+            st.error("That email and password don't match.")
+    st.stop()
+
+user = st.session_state["user"]
 if "products" not in st.session_state:
     try:
-        load_products("Loading products from Shopify…")
+        reload_products()
     except Exception as e:
         st.error(f"Couldn't load products: {e}")
         st.stop()
+products = st.session_state["products"]
+st.session_state.setdefault("editor_v", 0)
 
-st.title("Return labels")
-st.caption(f"{len(st.session_state['products'])} products, loaded {st.session_state['loaded_at']}")
+st.session_state.setdefault("upload_v", 0)
 
-# ---- Search ----
-with st.form("search", border=False):
-    q_col, b_col = st.columns([5, 1], vertical_alignment="bottom")
-    query = q_col.text_input("Search by product name or SKU", placeholder="For example: Maha cement, or SKYJQ")
-    searched = b_col.form_submit_button("Search", **STRETCH)
-if searched:
-    st.session_state["query"] = query.strip()
-q = st.session_state.get("query", "")
-if q:
-    found = search(st.session_state["products"], q)
-    r_col, c_col = st.columns([5, 1], vertical_alignment="center")
-    if found.empty:
-        r_col.info(f"No products match “{q}”. Check the spelling or try part of the name.")
-    else:
-        r_col.caption(f"{len(found)} result{'s' if len(found) != 1 else ''} for “{q}”" + (" (first 100)" if len(found) == 100 else ""))
-    if c_col.button("Clear search", **STRETCH):
-        st.session_state["query"] = ""
-        st.rerun()
-    if not found.empty:
-        st.dataframe(found, hide_index=True, height=table_height(len(found), 230), **STRETCH)
 
-st.divider()
+def clear_all():
+    """Clear button: empty the search box, the sheet, and the table."""
+    st.session_state["q"] = ""
+    st.session_state.pop("source", None)
+    st.session_state["upload_v"] += 1
 
-# ---- Result of the last apply ----
-res = st.session_state.get("results")
-if res is not None:
-    done = int((res["Result"] == "Done").sum())
-    failed = len(res) - done
-    if failed:
-        st.warning(f"Updated {done} products. {failed} failed, see the report.")
-    else:
-        st.success(f"Updated {done} products on Shopify. The table below now shows the new labels.")
-    b1, b2, b3 = st.columns(3)
-    b1.download_button("Download report", res.to_csv(index=False), "return_labels_report.csv", **STRETCH)
-    b2.download_button("Download backup of old labels", st.session_state["backup_json"],
-                       st.session_state["backup_name"], **STRETCH)
-    if b3.button("Close", **STRETCH):
-        st.session_state.pop("results", None)
-        st.rerun()
 
-# ---- Upload ----
-up_col, sample_col = st.columns([5, 1], vertical_alignment="center")
-uploaded = up_col.file_uploader("Upload sheet with SKU, Return (Yes/No) and Return_days",
-                                type=["csv", "tsv", "txt", "xlsx", "xls"])
-sample_col.download_button("Sample sheet", SAMPLE_SHEET, "return_labels_sample.csv", **STRETCH)
+if st.session_state.pop("reset_query", False):  # a sheet was just loaded
+    st.session_state["q"] = ""
 
-if uploaded is None:
-    st.info("Upload a sheet to see what will change. Nothing changes on Shopify until you click Apply.")
-else:
-    # Fetch the latest labels whenever a new sheet is uploaded, so the preview is never stale.
-    sheet_key = (uploaded.name, uploaded.size)
-    if st.session_state.get("loaded_for") != sheet_key:
+head, who, out = st.columns([6, 2.5, 0.8], vertical_alignment="center")
+head.markdown("### Return labels")
+who.markdown(f"<div style='text-align:right;opacity:.7'>{html.escape(user)}</div>", unsafe_allow_html=True)
+if out.button("Sign out", type="tertiary"):
+    st.session_state.clear()
+    st.rerun()
+
+tab_update, tab_history = st.tabs(["Update", "History"])
+
+with tab_update:
+    left, right = st.columns(2, vertical_alignment="top")
+    with left:
+        with st.form("search", border=False):
+            q_col, s_col, c_col = st.columns([6, 1, 1], vertical_alignment="bottom")
+            query = q_col.text_input("Search by product name or SKU", key="q",
+                                     placeholder="For example: Maha cement, or SKYJQ")
+            go = s_col.form_submit_button("Search", **STRETCH)
+            c_col.form_submit_button("Clear", on_click=clear_all, **STRETCH)
+    with right:
+        uploaded = st.file_uploader("Or upload a sheet with SKU, Return (Yes/No) and Return_days",
+                                    type=["csv", "tsv", "txt", "xlsx", "xls"],
+                                    key=f"upload_{st.session_state['upload_v']}")
+
+    if go and query.strip():
+        st.session_state["source"] = {"kind": "search", "query": query.strip()}
+        st.session_state["editor_v"] += 1
+    if uploaded is not None:
+        # Read the sheet once, then empty the upload box so the page layout stays the same.
         try:
-            load_products("Getting the latest labels from Shopify…")
-            st.session_state["loaded_for"] = sheet_key
+            reload_products()
+            items, sheet_notes = read_sheet(uploaded)
+            st.session_state["source"] = {"kind": "sheet", "name": uploaded.name, "items": items, "notes": sheet_notes}
+            st.session_state["editor_v"] += 1
+            st.session_state["reset_query"] = True
         except Exception as e:
-            st.error(f"Couldn't load products: {e}")
-    products = st.session_state["products"]
+            st.session_state["flash"] = {"text": str(e), "failed": True}
+        st.session_state["upload_v"] += 1
+        st.rerun()
 
-    try:
-        rules, sheet_problems = read_sheet(uploaded)
-    except Exception as e:
-        st.error(str(e))
-        rules, sheet_problems = None, []
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        (st.error if flash["failed"] else st.success)(flash["text"])
 
-    if rules is not None:
-        table, writes, inactive, plan_problems = build_plan(products, rules)
-        problems = sheet_problems + plan_problems
-        changing = sum(1 for r in table if r["Change"] != "No change")
+    src = st.session_state.get("source")
+    if not src:
+        st.info("Search for a product or upload a sheet. You can then set Return and Return days in the table and apply.")
+    else:
+        if src["kind"] == "search":
+            base, notes = build_table(products, search_items(products, src["query"]))
+            label = f"matching “{src['query']}”"
+        else:
+            base, notes = build_table(products, src["items"])
+            notes = src["notes"] + notes
+            label = f"from {src['name']}"
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("SKUs that will change", changing)
-        m2.metric("Already correct", len(table) - changing)
-        m3.metric("Draft or archived, not changed", inactive)
-        m4.metric("Need attention", len(problems))
+        if base.empty:
+            st.info(f"No active products {label}.")
+        else:
+            v = st.session_state["editor_v"]
+            if st.session_state.get("edits_v") != v:  # new search, new sheet, or just applied
+                st.session_state["edits_v"] = v
+                st.session_state["edits"] = {
+                    i: (r["Return"], "" if pd.isna(r["Return days"]) else str(int(r["Return days"])))
+                    for i, r in base.reset_index(drop=True).iterrows()
+                }
+                st.session_state["page"] = 0
+            edits = st.session_state["edits"]
+            base = base.reset_index(drop=True)
+            pages = max(1, -(-len(base) // PAGE_SIZE))
+            page = min(st.session_state.get("page", 0), pages - 1)
+            first = page * PAGE_SIZE
 
-        if table:
-            view = pd.DataFrame(table)
-            st.dataframe(view.style.apply(highlight_changes, axis=1), hide_index=True,
-                         height=table_height(len(view)), **STRETCH)
-            st.caption("Highlighted cells are the values that will change.")
+            with st.container(key="grid"):
+                head_cells = st.columns(GRID_WIDTHS)
+                for cell, title in zip(head_cells, ["SKU", "Product", "Current status", "Current return days", "New: Return", "New: Return days"]):
+                    cell.markdown(f"**{title}**")
+                for i in range(first, min(first + PAGE_SIZE, len(base))):
+                    r = base.iloc[i]
+                    ret0, days0 = edits[i]
+                    cells = st.columns(GRID_WIDTHS, vertical_alignment="center")
+                    cells[0].markdown(md(r["SKU"]))
+                    cells[1].markdown(md(r["Product"]))
+                    cells[2].markdown(md(r["Current status"]))
+                    cells[3].markdown("" if pd.isna(r["Current return days"]) else str(int(r["Current return days"])))
+                    ret_key, days_key = f"ret_{v}_{i}", f"days_{v}_{i}"
+                    if days_key not in st.session_state:
+                        st.session_state[days_key] = days0
+                    ret = cells[4].selectbox(
+                        "New: Return", ["Yes", "No"], key=ret_key, label_visibility="collapsed",
+                        index=["Yes", "No"].index(ret0) if ret0 in ("Yes", "No") else None, placeholder="Choose",
+                        on_change=on_return_change, args=(ret_key, days_key),
+                    )
+                    days = cells[5].text_input(
+                        "New: Return days", key=days_key, label_visibility="collapsed", placeholder="Days",
+                    )
+                    edits[i] = (ret, days)
 
-        if writes:
-            if st.button(f"Apply changes to {changing} SKUs on Shopify", type="primary", **STRETCH):
-                with st.spinner(f"Updating {len(writes)} products…"):
-                    report, backup_json = apply_changes(products, writes)
-                st.session_state["results"] = report
-                st.session_state["backup_json"] = backup_json
-                st.session_state["backup_name"] = f"backup_{datetime.datetime.now():%Y%m%d_%H%M%S}.json"
-                st.session_state.pop("products", None)  # reload so the table shows the new labels
+            edited = base.copy()
+            edited["Return"] = [edits[i][0] for i in range(len(base))]
+            edited["Return days"] = [edits[i][1] for i in range(len(base))]
+            writes, errors, plan_notes = plan_changes(products, edited, base, only_edited=src["kind"] == "search")
+            notes += plan_notes
+            n_skus = sum(w["n"] for w in writes)
+
+            info_col, prev_col, page_col, next_col, btn_col = st.columns([5, 0.5, 1, 0.5, 1.4], vertical_alignment="center")
+            summary = f"{len(base)} SKU{'s' if len(base) != 1 else ''} {label}. **{n_skus} will change.**"
+            if errors:
+                summary += f" Fix {len(errors)} error{'s' if len(errors) != 1 else ''} to apply."
+            elif not writes:
+                summary += " Everything already matches Shopify."
+            info_col.markdown(summary)
+            if pages > 1:
+                if prev_col.button("‹", key="prev", disabled=page == 0, **STRETCH):
+                    st.session_state["page"] = page - 1
+                    st.rerun()
+                page_col.markdown(f"<div style='text-align:center'>{page + 1} / {pages}</div>", unsafe_allow_html=True)
+                if next_col.button("›", key="next", disabled=page >= pages - 1, **STRETCH):
+                    st.session_state["page"] = page + 1
+                    st.rerun()
+            if btn_col.button(f"Apply {n_skus} change{'s' if n_skus != 1 else ''}", type="primary",
+                              disabled=bool(errors) or not writes, **STRETCH):
+                with st.spinner("Updating Shopify…"):
+                    failed = apply_changes(products, writes, user)
+                done = len(writes) - len(failed)
+                text = f"Updated {done} product{'s' if done != 1 else ''} on Shopify."
+                if failed:
+                    text += " Failed: " + "; ".join(f"{s} ({m})" for s, m in failed[:5])
+                st.session_state["flash"] = {"text": text, "failed": bool(failed)}
+                reload_products()
+                st.session_state["editor_v"] += 1
                 st.rerun()
-        elif table and not problems:
-            st.success("Everything in this sheet already matches Shopify.")
 
-        if problems:
-            with st.expander(f"{len(problems)} SKUs need attention"):
-                st.dataframe(pd.DataFrame(problems), hide_index=True,
-                             height=table_height(len(problems), 260), **STRETCH)
+            if errors:
+                st.error("\n".join(f"- {e}" for e in errors[:6]) + (f"\n- …and {len(errors) - 6} more" if len(errors) > 6 else ""))
+            if notes:
+                with st.expander(f"{len(notes)} note{'s' if len(notes) != 1 else ''}"):
+                    st.markdown("\n".join(f"- {n}" for n in notes))
+
+with tab_history:
+    hist = history_table(products)
+    if hist.empty:
+        st.info("No changes yet. Every update made in this app is listed here with who made it and when.")
+    else:
+        cap_col, dl_col = st.columns([5, 1], vertical_alignment="center")
+        cap_col.caption(f"{len(hist)} change{'s' if len(hist) != 1 else ''}, newest first. Up to {HISTORY_KEEP} are kept per product.")
+        dl_col.download_button("Download", hist.to_csv(index=False), "return_label_history.csv", **STRETCH)
+        st.dataframe(hist, hide_index=True, height=EDITOR_HEIGHT + 90, **STRETCH)
