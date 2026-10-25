@@ -132,7 +132,15 @@ def get_token():
         timeout=30,
     )
     if r.status_code != 200:
-        raise RuntimeError(f"Shopify login failed ({r.status_code}): {r.text[:300]}")
+        text = r.text
+        if "application_cannot_be_found" in text:
+            raise RuntimeError("Shopify doesn't recognise SHOPIFY_CLIENT_ID. Copy the Client ID again from the Dev Dashboard into Secrets.")
+        if "invalid_client" in text or "client_secret" in text.lower():
+            raise RuntimeError("Shopify rejected the client secret. Copy the Client secret again from the Dev Dashboard into Secrets.")
+        if r.status_code == 404:
+            raise RuntimeError(f"Shopify couldn't find the store '{SHOP}'. Check SHOPIFY_STORE in Secrets (it should end in .myshopify.com).")
+        title = re.search(r"<title>(.*?)</title>", text, re.S)
+        raise RuntimeError(f"Shopify login failed ({r.status_code}): {(title.group(1) if title else text[:200]).strip()}")
     st.session_state["token"] = {"value": r.json()["access_token"], "at": time.time()}
     return st.session_state["token"]["value"]
 
@@ -157,6 +165,12 @@ def gql(query, variables):
             if any((e.get("extensions") or {}).get("code") == "THROTTLED" for e in errors):
                 time.sleep(2 + attempt * 2)
                 continue
+            if any((e.get("extensions") or {}).get("code") == "ACCESS_DENIED" for e in errors):
+                raise RuntimeError(
+                    "The Shopify app in Secrets doesn't have permission to read and update products. "
+                    "In the Dev Dashboard, make sure its active version has the scopes read_products and write_products, "
+                    "that it's installed on the store, and that SHOPIFY_CLIENT_ID belongs to that app. Then reboot this app and sign in again."
+                )
             raise RuntimeError(f"Shopify error: {errors}")
         return body["data"]
     raise RuntimeError("Shopify is busy. Wait a minute and try again.")
